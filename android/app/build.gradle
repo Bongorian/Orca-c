@@ -1,0 +1,24 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.hundredrabbits.orcac"
+    compileSdk 34
+    buildToolsVersion "35.0.1"
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        applicationId "com.hundredrabbits.orcac"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    packaging {
+        jniLibs {
+            keepDebugSymbols += ["**/*.so"]
+        }
+    }
+}
