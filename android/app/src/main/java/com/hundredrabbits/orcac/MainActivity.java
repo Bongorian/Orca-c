@@ -1,13 +1,18 @@
 package com.hundredrabbits.orcac;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.database.Cursor;
+import android.provider.OpenableColumns;
+import android.widget.Toast;
 import android.media.midi.MidiDevice;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiInputPort;
@@ -30,8 +35,7 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 
 import java.io.ByteArrayOutputStream;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.DatagramPacket;
@@ -50,6 +54,9 @@ import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "orca_c_state";
+    private static final int OPEN_DOCUMENT = 100;
+    private static final int CREATE_DOCUMENT = 101;
+    private Uri documentUri;
     private static final int TERM_BG = 0xff101214;
     private static final int TERM_FG = 0xffe8e8e8;
     private static final int TERM_DOT = 0xff51565c;
@@ -139,7 +146,14 @@ public final class MainActivity extends Activity {
         terminalView = new TerminalView(this);
         setContentView(terminalView);
         restoreState();
-        handleExternalIntent(getIntent());
+        if (savedInstanceState != null) {
+            terminalView.loadGrid(savedInstanceState.getString("documentGrid", terminalView.gridToString()));
+            fileName = savedInstanceState.getString("documentName", fileName);
+            String uri = savedInstanceState.getString("documentUri");
+            documentUri = uri == null ? null : Uri.parse(uri);
+        } else {
+            handleExternalIntent(getIntent());
+        }
         applyKeepScreenAwake();
         refreshMidiDevices();
         if (midiManager != null) {
@@ -157,6 +171,14 @@ public final class MainActivity extends Activity {
             resetVmFromGrid();
             scheduleAutoSave();
         }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle state) {
+        state.putString("documentGrid", terminalView.gridToString());
+        state.putString("documentName", fileName);
+        state.putString("documentUri", documentUri == null ? null : documentUri.toString());
+        super.onSaveInstanceState(state);
     }
 
     @Override
@@ -298,6 +320,8 @@ public final class MainActivity extends Activity {
         SharedPreferences.Editor editor = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
         if (includeGrid) {
             editor.putString("grid", terminalView.gridToString());
+            editor.putString("documentUri", documentUri == null ? null : documentUri.toString());
+            editor.putString("documentName", fileName);
         }
         editor.putString("fileName", fileName);
         editor.putString("oscHost", oscHost);
@@ -329,6 +353,9 @@ public final class MainActivity extends Activity {
         String grid = prefs.getString("grid", null);
         if (grid != null && !grid.isEmpty()) {
             terminalView.loadGrid(grid);
+            String uri = prefs.getString("documentUri", null);
+            documentUri = uri == null ? null : Uri.parse(uri);
+            fileName = prefs.getString("documentName", fileName);
             setStatus("restored");
         }
     }
@@ -346,13 +373,13 @@ public final class MainActivity extends Activity {
             }
             Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
             if (stream != null) {
-                return loadExternalUri(stream);
+                return loadIntentDocument(stream, intent);
             }
         }
         if (Intent.ACTION_VIEW.equals(action) || Intent.ACTION_EDIT.equals(action)) {
             Uri uri = intent.getData();
             if (uri != null) {
-                return loadExternalUri(uri);
+                return loadIntentDocument(uri, intent);
             }
         }
         return false;
@@ -364,28 +391,59 @@ public final class MainActivity extends Activity {
                 setStatus("open failed");
                 return false;
             }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buffer = new byte[4096];
-            for (;;) {
-                int read = in.read(buffer);
-                if (read < 0) {
-                    break;
-                }
-                out.write(buffer, 0, read);
-            }
-            String name = uri.getLastPathSegment();
-            if (name != null && !name.trim().isEmpty()) {
-                fileName = sanitizeFileName(name);
-            }
-            loadExternalGrid(out.toString("UTF-8"), "opened");
+            loadExternalGrid(readGridText(in), "opened");
+            fileName = documentName(uri);
             return true;
-        } catch (IOException | SecurityException e) {
-            setStatus("open failed");
+        } catch (IOException | RuntimeException e) {
+            documentError("Could not open file: " + e.getMessage());
             return false;
         }
     }
 
+    private String readGridText(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int count;
+        while ((count = in.read(buffer)) != -1) {
+            if (out.size() + count > 1024 * 1024) {
+                throw new IOException("File exceeds 1 MB");
+            }
+            out.write(buffer, 0, count);
+        }
+        String text = out.toString("UTF-8");
+        return text.startsWith("\uFEFF") ? text.substring(1) : text;
+    }
+
+    private void openLegacyFile() {
+        String[] names = fileList();
+        java.util.Arrays.sort(names);
+        if (names.length == 0) {
+            documentError("No old internal files found");
+            return;
+        }
+        stopPlayback();
+        terminalView.closeMenu();
+        new AlertDialog.Builder(this)
+                .setTitle("Open old internal file")
+                .setItems(names, (dialog, index) -> {
+                    try (InputStream in = openFileInput(names[index])) {
+                        loadExternalGrid(readGridText(in), "opened internal file");
+                        fileName = names[index];
+                        resetVmFromGrid();
+                        saveAutoState();
+                        setStatus("opened " + fileName + "; Save to export");
+                    } catch (IOException | RuntimeException e) {
+                        documentError("Could not open internal file");
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     private void loadExternalGrid(String grid, String source) {
+        stopPlayback();
+        documentUri = null;
+        fileName = "orca.orca";
         terminalView.loadGrid(grid);
         terminalView.closeMenu();
         hideKeyboard();
@@ -421,34 +479,124 @@ public final class MainActivity extends Activity {
     }
 
     private void saveFile() {
-        try (FileOutputStream out = openFileOutput(fileName, MODE_PRIVATE)) {
-            out.write(terminalView.gridToString().getBytes(StandardCharsets.UTF_8));
-            scheduleAutoSave();
-            setStatus("saved " + fileName);
-        } catch (IOException e) {
-            setStatus("save failed");
+        if (documentUri == null) {
+            saveFileAs();
+        } else {
+            writeDocument(documentUri);
         }
     }
 
     private void openFile() {
-        try (FileInputStream in = openFileInput(fileName)) {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buffer = new byte[4096];
-            for (;;) {
-                int read = in.read(buffer);
-                if (read < 0) {
-                    break;
-                }
-                out.write(buffer, 0, read);
-            }
-            terminalView.loadGrid(out.toString("UTF-8"));
-            vmDirty = true;
-            resetVmFromGrid();
-            scheduleAutoSave();
-            setStatus("opened " + fileName);
-        } catch (IOException e) {
-            setStatus("open failed");
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        // Providers may classify .orca as text, binary, or a custom MIME type.
+        intent.setType("*/*");
+        launchDocumentPicker(intent, OPEN_DOCUMENT);
+    }
+
+    private void saveFileAs() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/octet-stream");
+        String name = sanitizeFileName(fileName);
+        if (!name.toLowerCase(Locale.ROOT).endsWith(".orca")) {
+            name += ".orca";
         }
+        intent.putExtra(Intent.EXTRA_TITLE, name);
+        launchDocumentPicker(intent, CREATE_DOCUMENT);
+    }
+
+    private void launchDocumentPicker(Intent intent, int requestCode) {
+        stopPlayback();
+        terminalView.closeMenu();
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (ActivityNotFoundException e) {
+            documentError("No Android file picker available");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != OPEN_DOCUMENT && requestCode != CREATE_DOCUMENT) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            setStatus("cancelled");
+            return;
+        }
+        Uri uri = data.getData();
+        if (requestCode == OPEN_DOCUMENT) {
+            if (loadIntentDocument(uri, data)) {
+                resetVmFromGrid();
+                saveAutoState();
+                setStatus("opened " + fileName);
+            }
+        } else {
+            retainDocumentPermission(uri, data);
+            writeDocument(uri);
+        }
+    }
+
+    private boolean loadIntentDocument(Uri uri, Intent intent) {
+        if (!loadExternalUri(uri)) {
+            return false;
+        }
+        retainDocumentPermission(uri, intent);
+        documentUri = uri;
+        return true;
+    }
+
+    private void retainDocumentPermission(Uri uri, Intent intent) {
+        int flags = intent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        if (flags != 0 && (intent.getFlags() & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri, flags);
+            } catch (SecurityException ignored) {
+                // Shared files can grant temporary access only.
+            }
+        }
+    }
+
+    private String documentName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
+                return sanitizeFileName(cursor.getString(0));
+            }
+        } catch (RuntimeException ignored) {
+            // Some external providers do not expose document metadata.
+        }
+        String name = uri.getLastPathSegment();
+        return sanitizeFileName(name == null ? "orca.orca" : name);
+    }
+
+    private void writeDocument(Uri uri) {
+        try {
+            try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+                if (out == null) {
+                    throw new IOException("No output stream");
+                }
+                out.write(terminalView.gridToString().getBytes(StandardCharsets.UTF_8));
+            }
+            documentUri = uri;
+            fileName = documentName(uri);
+            saveAutoState();
+            terminalView.closeMenu();
+            setStatus("saved " + fileName);
+        } catch (IOException | RuntimeException e) {
+            documentError("Save failed. Use Save As to choose a writable file.");
+        }
+    }
+
+    private void documentError(String message) {
+        setStatus(message);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private String sanitizeFileName(String raw) {
@@ -874,6 +1022,18 @@ public final class MainActivity extends Activity {
             boolean ctrl = event.isCtrlPressed();
             boolean shift = event.isShiftPressed();
             boolean alt = event.isAltPressed();
+            if (ctrl && keyCode == KeyEvent.KEYCODE_O) {
+                openFile();
+                return true;
+            }
+            if (ctrl && keyCode == KeyEvent.KEYCODE_S) {
+                if (shift) {
+                    saveFileAs();
+                } else {
+                    saveFile();
+                }
+                return true;
+            }
             if (keyCode == KeyEvent.KEYCODE_F1 || ctrl && keyCode == KeyEvent.KEYCODE_D) {
                 openMenu(MenuId.MAIN);
                 return true;
@@ -1324,6 +1484,9 @@ public final class MainActivity extends Activity {
             if (menuId == MenuId.MAIN) {
                 switch (menuIndex) {
                     case 0:
+                        stopPlayback();
+                        documentUri = null;
+                        fileName = "orca.orca";
                         initGrid(18, 32);
                         cursorY = cursorX = 0;
                         vmDirty = true;
@@ -1340,7 +1503,7 @@ public final class MainActivity extends Activity {
                         saveFile();
                         return;
                     case 3:
-                        beginEdit(EditTarget.FILE_NAME, fileName);
+                        saveFileAs();
                         return;
                     case 5:
                         beginEdit(EditTarget.BPM, String.valueOf(bpm));
@@ -1445,6 +1608,9 @@ public final class MainActivity extends Activity {
             }
             if (menuId == MenuId.ANDROID) {
                 switch (menuIndex) {
+                    case 3:
+                        openLegacyFile();
+                        return;
                     case 0:
                         keepScreenAwake = !keepScreenAwake;
                         applyKeepScreenAwake();
@@ -1586,6 +1752,7 @@ public final class MainActivity extends Activity {
                             "[" + (keepScreenAwake ? "*" : " ") + "] Keep Screen Awake",
                             "[" + (autoSaveEnabled ? "*" : " ") + "] Auto-save Session",
                             "Save Session Now",
+                            "Open Old Internal File...",
                             "Back"
                     };
                 case MAIN:
